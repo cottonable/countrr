@@ -3,7 +3,6 @@ package main
 import (
 	"bufio"
 	"context"
-	_ "embed"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -32,9 +31,6 @@ type Config struct {
 	RateLimitWindowS       int64  `json:"rate_limit_window_s"`
 	RateLimitSweepS        int64  `json:"rate_limit_sweep_s"`
 	MinIncrementIntervalMs int64  `json:"min_increment_interval_ms"`
-	TurnstileSiteKey       string `json:"turnstile_site_key"`
-	TurnstileSecret        string `json:"turnstile_secret"`
-	TurnstileTimeoutS      int64  `json:"turnstile_timeout_s"`
 }
 
 // Default values used when config.json doesn't exist or is invalid.
@@ -48,7 +44,6 @@ func DefaultConfig() Config {
 		RateLimitWindowS:       21600, // 6h
 		RateLimitSweepS:        300,   // 5 min
 		MinIncrementIntervalMs: 0,     // disabled
-		TurnstileTimeoutS:      5,     // 5s
 	}
 }
 
@@ -87,9 +82,6 @@ func LoadConfig(path string) (Config, error) {
 	}
 	if cfg.BackupCount < 0 {
 		cfg.BackupCount = 0
-	}
-	if cfg.TurnstileTimeoutS <= 0 {
-		cfg.TurnstileTimeoutS = DefaultConfig().TurnstileTimeoutS
 	}
 	return cfg, nil
 }
@@ -134,16 +126,6 @@ func logStamp() string {
 	return logTimestamp.Render("[" + time.Now().Format("2006-01-02 15:04:05") + "]")
 }
 
-// TurnstileResponse represents the JSON from Cloudflare's verification API.
-type TurnstileResponse struct {
-	Success    bool     `json:"success"`
-	ErrorCodes []string `json:"error_codes"`
-	Score      *float64 `json:"score"`
-	Action     string   `json:"action,omitempty"`
-}
-
-// verifyTurnstile checks a token against Cloudflare. Returns false if turnstile
-// is not configured or verification fails.
 // realIP extracts the visitor's real IP from headers (for reverse proxy support),
 // falling back to RemoteAddr. Checks CF-Connecting-IP first, then X-Forwarded-For.
 func realIP(r *http.Request) string {
@@ -166,76 +148,14 @@ func realIP(r *http.Request) string {
 	return ip
 }
 
-// turnstileTimeout is how long the server waits for Cloudflare before treating
-// verification as inconclusive. On a timeout the request is allowed through, so
-// this is the leniency window. It never returns zero: a zero client timeout
-// means "wait forever", which would hang the request instead of failing open.
-func turnstileTimeout(cfg Config) time.Duration {
-	if cfg.TurnstileTimeoutS <= 0 {
-		return time.Duration(DefaultConfig().TurnstileTimeoutS) * time.Second
-	}
-	return time.Duration(cfg.TurnstileTimeoutS) * time.Second
-}
-
-// serverWriteTimeout leaves enough room for the slowest handler, which is a
-// request that has to wait out the outbound Turnstile verification before it
-// can answer.
+// serverWriteTimeout sets the HTTP handler write timeout so slow clients
+// don't hold connections open indefinitely.
 func serverWriteTimeout(cfg Config) time.Duration {
-	const base = 10 * time.Second
-	if padded := turnstileTimeout(cfg) + 5*time.Second; padded > base {
-		return padded
-	}
-	return base
-}
-
-func verifyTurnstile(token, remoteIP string) bool {
-	cfg := currentConfig()
-	if cfg.TurnstileSecret == "" || cfg.TurnstileSiteKey == "" {
-		return true // not configured → allow
-	}
-
-	payload := strings.NewReader(fmt.Sprintf(
-		`{"secret":"%s","response":"%s","remoteip":"%s"}`,
-		cfg.TurnstileSecret,
-		token,
-		remoteIP,
-	))
-
-	req, err := http.NewRequestWithContext(context.Background(),
-		http.MethodPost,
-		"https://challenges.cloudflare.com/turnstile/v0/siteverify",
-		payload,
-	)
-	if err != nil {
-		fmt.Println(logError.Render("turnstile req error:", err.Error()))
-		return true
-	}
-	req.Header.Set("Content-Type", "application/json")
-
-	client := &http.Client{Timeout: turnstileTimeout(cfg)}
-	resp, err := client.Do(req)
-	if err != nil {
-		fmt.Println(logWarning.Render("turnstile verification error:", err.Error()))
-		return true // network failure → allow (don't break site)
-	}
-	defer resp.Body.Close()
-
-	var tr TurnstileResponse
-	if err := json.NewDecoder(resp.Body).Decode(&tr); err != nil {
-		fmt.Println(logError.Render("turnstile decode error:", err.Error()))
-		return true
-	}
-	if !tr.Success {
-		fmt.Println(logWarning.Render(fmt.Sprintf("turnstile failed: %v", tr.ErrorCodes)))
-	}
-	return tr.Success
+	return 10 * time.Second
 }
 
 // Version is the current release version.
 const Version = "1"
-
-//go:embed countrr.js
-var visitorJS []byte
 
 var (
 	configMu sync.RWMutex
@@ -245,7 +165,6 @@ var (
 	lastSaved atomic.Int64
 	lastCheck atomic.Int64
 
-	turnstileFailures atomic.Int64
 	throttled         atomic.Int64
 
 	throttleMu    sync.Mutex
@@ -279,7 +198,7 @@ func corsMiddleware(next http.Handler) http.Handler {
 			w.Header().Set("Access-Control-Allow-Origin", "*")
 		}
 		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-		w.Header().Set("Access-Control-Allow-Headers", "X-Turnstile-Token, Content-Type")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
 		w.Header().Set("Access-Control-Max-Age", "86400")
 
 		if r.Method == http.MethodOptions {
@@ -428,13 +347,8 @@ func startService(cfg Config) (*service, error) {
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /increment", increment)
 	mux.HandleFunc("GET /count", getCount)
-	mux.Handle("GET /countrr.js", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/javascript; charset=utf-8")
-		w.Write(visitorJS)
-	}))
 
 	// Timeouts keep slow or half-open clients from holding a connection forever.
-	// WriteTimeout has to outlast the outbound Turnstile verification.
 	server := &http.Server{
 		Handler:           corsMiddleware(mux),
 		ReadHeaderTimeout: 5 * time.Second,
@@ -487,14 +401,10 @@ func checkLoop(ctx context.Context, cfg Config) {
 		case <-ticker.C:
 			current := visitors.Load()
 			delta := current - lastCheck.Load()
-			fails := turnstileFailures.Swap(0)
 			dropped := throttled.Swap(0)
-			if delta > 0 || fails > 0 || dropped > 0 {
+			if delta > 0 || dropped > 0 {
 				msg := fmt.Sprintf("[%s] +%d new hits | ram: %d | last saved: %d",
 					time.Now().Format("2006-01-02 15:04:05"), delta, current, lastSaved.Load())
-				if fails > 0 {
-					msg += fmt.Sprintf(" | turnstile failures: %d", fails)
-				}
 				if dropped > 0 {
 					msg += fmt.Sprintf(" | throttled: %d", dropped)
 				}
@@ -668,8 +578,7 @@ func writeFileSynced(path, data string) error {
 }
 
 func increment(w http.ResponseWriter, r *http.Request) {
-	// Checked first so a flood cannot reach the outbound Turnstile call or grow
-	// the per-IP map.
+	// Checked first so a flood cannot grow the per-IP map.
 	interval := time.Duration(currentConfig().MinIncrementIntervalMs) * time.Millisecond
 	if !allowIncrement(interval) {
 		throttled.Add(1)
@@ -679,14 +588,6 @@ func increment(w http.ResponseWriter, r *http.Request) {
 	}
 
 	ip := realIP(r)
-
-	token := r.Header.Get("X-Turnstile-Token")
-	if !verifyTurnstile(token, ip) {
-		turnstileFailures.Add(1)
-		w.WriteHeader(http.StatusForbidden)
-		w.Write([]byte("verification failed"))
-		return
-	}
 
 	if !canHit(ip) {
 		w.WriteHeader(http.StatusTooManyRequests)

@@ -56,9 +56,6 @@ func fieldDefs() []fieldDef {
 		{name: "rate_limit_window_s", label: "Rate Limit Window (s)", defVal: strconv.FormatInt(dc.RateLimitWindowS, 10), help: "IP cooldown before allowing another request. Default: " + fmt.Sprint(dc.RateLimitWindowS) + "s"},
 		{name: "rate_limit_sweep_s", label: "Rate Limit Sweep (s)", defVal: strconv.FormatInt(dc.RateLimitSweepS, 10), help: "How often expired IP cooldowns are pruned from memory. Default: " + fmt.Sprint(dc.RateLimitSweepS) + "s"},
 		{name: "min_increment_interval_ms", label: "Min Increment Interval (ms)", defVal: strconv.FormatInt(dc.MinIncrementIntervalMs, 10), help: "Global minimum spacing between counted visits (1000 = 1s, 500 = 0.5s). 0 disables. Default: " + fmt.Sprint(dc.MinIncrementIntervalMs) + "ms"},
-		{name: "turnstile_site_key", label: "Turnstile Site Key *", defVal: "", help: "Cloudflare Turnstile key. Get one at https://dash.cloudflare.com → Turnstile → Add New Site. Leave blank to skip."},
-		{name: "turnstile_secret", label: "Turnstile Secret *", defVal: "", help: "Secret matching your site key. Leave blank if skipping turnstile."},
-		{name: "turnstile_timeout_s", label: "Turnstile Timeout (s)", defVal: strconv.FormatInt(dc.TurnstileTimeoutS, 10), help: "How long to wait for Cloudflare before letting the request through anyway. Default: " + fmt.Sprint(dc.TurnstileTimeoutS) + "s"},
 	}
 }
 
@@ -80,12 +77,6 @@ func defaultStr(cfg Config, name string) string {
 		return strconv.FormatInt(cfg.RateLimitSweepS, 10)
 	case "min_increment_interval_ms":
 		return strconv.FormatInt(cfg.MinIncrementIntervalMs, 10)
-	case "turnstile_site_key":
-		return cfg.TurnstileSiteKey
-	case "turnstile_secret":
-		return cfg.TurnstileSecret
-	case "turnstile_timeout_s":
-		return strconv.FormatInt(cfg.TurnstileTimeoutS, 10)
 	}
 	return ""
 }
@@ -432,16 +423,6 @@ func (m *Model) toConfig(cfg Config) Config {
 			if v != "" {
 				if n, err := strconv.ParseInt(v, 10, 64); err == nil && n >= 0 {
 					cfg.MinIncrementIntervalMs = n
-				}
-			}
-		case "turnstile_site_key":
-			cfg.TurnstileSiteKey = v
-		case "turnstile_secret":
-			cfg.TurnstileSecret = v
-		case "turnstile_timeout_s":
-			if v != "" {
-				if n, err := strconv.ParseInt(v, 10, 64); err == nil && n > 0 {
-					cfg.TurnstileTimeoutS = n
 				}
 			}
 		}

@@ -34,3 +34,4 @@ go.work.sum
 counter.txt
 config.json
 RELEASE.md
+scripts/release.sh
