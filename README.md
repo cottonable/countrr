@@ -61,11 +61,11 @@ Go: [Go 1.24](https://go.dev/dl/) or later (or use a prebuilt binary below)
 
 || Binary | OS | Architecture | Minimum version |
 |--------|----|--------------|-----------------|
-| `countrr-linux-amd64` | Linux | x86_64 | any; statically linked, no glibc dependency |
-| `countrr-linux-386` | Linux | i386 (32-bit x86) | any; statically linked |
-| `countrr-linux-arm` | Linux | ARMv7 (32-bit) | any; statically linked |
-| `countrr-linux-armv6` | Linux | ARMv6 (32-bit) | any; statically linked |
-| `countrr-linux-arm64` | Linux | ARM64 (AArch64) | any; statically linked |
+| `countrr-linux-amd64` | Linux | x86_64 | any |
+| `countrr-linux-386` | Linux | i386 (32-bit x86) | any |
+| `countrr-linux-arm` | Linux | ARMv7 (32-bit) | any |
+| `countrr-linux-armv6` | Linux | ARMv6 (32-bit) | any |
+| `countrr-linux-arm64` | Linux | ARM64 (AArch64) | any |
 | `countrr-darwin-amd64` | macOS | Intel (x86_64) | 13 Ventura |
 | `countrr-darwin-arm64` | macOS | Apple Silicon (M1+) | 13 Ventura |
 | `countrr-windows-amd64.exe` | Windows | x86_64 | 10 or later |
