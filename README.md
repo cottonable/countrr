@@ -5,12 +5,12 @@ A lightweight, self-hosted website visitor counter built in Go. Track unique vis
 ## Architecture
 
 ```
-┌──────────────┐      POST /increment       ┌───────────────┐
-│   Your Site  │ ──────────────────────────► │   Go Server    │
-│  (browser)   │     X-Turnstile-Token       │  configurable    │
-│              │ ◄──── GET /count ────────── │                │
-│ trackPageView│        visitor count         │ counter.txt   │
-└──────────────┘                            └───────────────┘
+┌──────────────┐        POST /increment      ┌───────────────┐
+│   Your Site  │ ──────────────────────────► │   Go Server   │
+│   (browser)  │       X-Turnstile-Token     │  configurable │
+│              │ ◄─────── GET /count ─────── │               │
+│ trackPageView│        visitor count        │  counter.txt  │
+└──────────────┘                             └───────────────┘
 ```
 
 **How it works:** Each browser uses [Cloudflare Turnstile](https://developers.cloudflare.com/turnstile/) to prove it's a real device. The server verifies the token and rate-limits each IP to one vote every ~6 hours, preventing spam. Visits are saved to disk every 15 minutes, written atomically (temp file plus rename) so an interrupted write can never corrupt the count. Turnstile can be disabled entirely by leaving both `turnstile_*` fields empty in config.
@@ -37,13 +37,15 @@ Go: [Go 1.24](https://go.dev/dl/) or later (or use a prebuilt binary below)
 
 ### Supported platforms
 
-| Binary | OS | Architecture | Notes |
-|--------|----|--------------|-------|
-| `counter-linux-amd64` | Linux | x86_64 | statically linked, no glibc dependency |
-| `counter-linux-arm` | Linux | ARM 32-bit | statically linked, ARMv7 (`GOARM=7`) |
-| `counter-darwin-amd64` | macOS | Intel (x86_64) | 10.15 Catalina or later |
-| `counter-darwin-arm64` | macOS | Apple Silicon | 11 Big Sur or later |
-| `counter-windows-amd64.exe` | Windows | x86_64 | 7 or later |
+| Binary | OS | Architecture | Minimum version |
+|--------|----|--------------|-----------------|
+| `counter-linux-amd64` | Linux | x86_64 | any; statically linked, no glibc dependency |
+| `counter-linux-arm` | Linux | ARM 32-bit | any; statically linked, ARMv7 (`GOARM=7`) |
+| `counter-darwin-amd64` | macOS | Intel (x86_64) | 13 Ventura |
+| `counter-darwin-arm64` | macOS | Apple Silicon | 13 Ventura |
+| `counter-windows-amd64.exe` | Windows | x86_64 | 10 or later |
+
+The macOS minimum is the deployment target the Go linker stamps into the binary (`minos 13.0`), and the Windows one is the PE subsystem version (`10.0`) plus the toolchain's own floor, which has been Windows 10 since Go 1.21. Building with an older Go toolchain is what would lower the macOS figure.
 
 The Linux builds are fully static, so they run on any distribution (including Alpine/musl) and do not depend on a particular glibc version. For ARMv6 boards such as the Raspberry Pi 1 or Zero, rebuild `counter-linux-arm` with `GOARM=6`.
 
@@ -78,7 +80,7 @@ The live reconfigure keeps the in-memory visit count and the steady-state signal
 Download the right binary for your platform from the [Releases page](https://github.com/cottonable/countrr/releases/latest):
 
 ```bash
-wget https://github.com/cottonable/countrr/releases/latest/download/counter-linux-arm
+wget https://github.com/cottonable/countrr/releases/latest/download/counter-{platform}-{architecture}
 chmod +x counter-linux-arm
 ./counter-linux-arm
 ```
