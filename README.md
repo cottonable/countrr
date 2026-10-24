@@ -117,13 +117,15 @@ The server reads `config.json` at startup. If it doesn't exist, an interactive s
 {
   "port": 1312,                   // HTTP listen port
   "counter_file": "counter.txt",  // path for visit data storage
+  "backup_count": 0,              // timestamped counter snapshots to keep (0 = off)
   "persist_interval_s": 900,      // seconds between disk writes (15 min)
   "check_interval_s": 60,         // seconds between log messages (1 min)
   "rate_limit_window_s": 21600,   // cooldown per visitor in seconds (6h)
   "rate_limit_sweep_s": 300,      // seconds between prunes of the per-IP cooldown map (5 min)
   "min_increment_interval_ms": 0, // global minimum spacing between counted visits (0 = off, 500 = 0.5s)
   "turnstile_site_key": "",       // Cloudflare Turnstile site key (optional)
-  "turnstile_secret": ""          // Cloudflare Turnstile secret key (optional)
+  "turnstile_secret": "",         // Cloudflare Turnstile secret key (optional)
+  "turnstile_timeout_s": 5        // seconds to wait for Cloudflare before allowing the visit anyway
 }
 ```
 
@@ -133,7 +135,9 @@ All numeric values are in seconds — plain integers for easy JSON parsing.
 
 `min_increment_interval_ms` is a global throughput cap, independent of any IP: at `500` the server counts at most one visit every half second, and every other request gets `429`. Leave it at `0` to disable. It is checked before anything else, so a flood never reaches the Turnstile API or the per-IP map. The trade-off is that a genuine burst of visitors arriving faster than the cap is dropped rather than queued, because the client script treats `429` as final; `500` or `1000` is generous for normal traffic.
 
-**Turnstile (anti-bot protection):** Leave both `turnstile_*` fields empty to disable. When you provide a site key + secret, every `/increment` request must include a verified turnstile token from the client-side script below. If verification fails (bot detected), the request is rejected with 403. Network errors during verification are lenient — they allow the request rather than breaking your site's visitors.
+`backup_count` keeps a rolling set of timestamped snapshots next to the counter file, so a corrupted or mistaken save can be rolled back. At `10` with the default 15-minute interval you hold roughly the last two and a half hours. Snapshots are named `<counter>-YYMMDD-HHMMSS.txt`, written only when the value actually changes (a restart that saves nothing creates nothing), and anything past the newest `backup_count` is deleted, including snapshots left behind by an earlier run. `0` disables it. The live `counter.txt` always stays the authoritative file; snapshots are copies, never renames.
+
+**Turnstile (anti-bot protection):** Leave both `turnstile_*` fields empty to disable. When you provide a site key + secret, every `/increment` request must include a verified turnstile token from the client-side script below. If verification fails (bot detected), the request is rejected with 403. Network errors during verification are lenient — they allow the request rather than breaking your site's visitors. `turnstile_timeout_s` (default `5`) is how long the server waits for Cloudflare before treating the answer as inconclusive and letting the visit through: raise it to be slower but stricter, lower it to be quicker to give up. The server's own write timeout automatically grows to stay above it.
 
 ## Integration on Your Site
 

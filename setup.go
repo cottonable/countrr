@@ -50,6 +50,7 @@ func fieldDefs() []fieldDef {
 	return []fieldDef{
 		{name: "port", label: "Server Port", defVal: strconv.Itoa(dc.Port), help: fmt.Sprintf("HTTP listening port (1–65535). Default: %d", dc.Port)},
 		{name: "counter_file", label: "Counter File", defVal: dc.CounterFile, help: "Path used for storing visit counts."},
+		{name: "backup_count", label: "Counter Backups", defVal: strconv.FormatInt(dc.BackupCount, 10), help: "Timestamped snapshots kept next to the counter file (YYMMDD-HHMMSS). 0 disables. Default: " + fmt.Sprint(dc.BackupCount)},
 		{name: "persist_interval_s", label: "Persist Interval (s)", defVal: strconv.FormatInt(dc.PersistIntervalS, 10), help: "Disk-write frequency. Default: " + fmt.Sprint(dc.PersistIntervalS) + "s"},
 		{name: "check_interval_s", label: "Check Interval (s)", defVal: strconv.FormatInt(dc.CheckIntervalS, 10), help: "Log-delta interval. Default: " + fmt.Sprint(dc.CheckIntervalS) + "s"},
 		{name: "rate_limit_window_s", label: "Rate Limit Window (s)", defVal: strconv.FormatInt(dc.RateLimitWindowS, 10), help: "IP cooldown before allowing another request. Default: " + fmt.Sprint(dc.RateLimitWindowS) + "s"},
@@ -57,6 +58,7 @@ func fieldDefs() []fieldDef {
 		{name: "min_increment_interval_ms", label: "Min Increment Interval (ms)", defVal: strconv.FormatInt(dc.MinIncrementIntervalMs, 10), help: "Global minimum spacing between counted visits (1000 = 1s, 500 = 0.5s). 0 disables. Default: " + fmt.Sprint(dc.MinIncrementIntervalMs) + "ms"},
 		{name: "turnstile_site_key", label: "Turnstile Site Key *", defVal: "", help: "Cloudflare Turnstile key. Get one at https://dash.cloudflare.com → Turnstile → Add New Site. Leave blank to skip."},
 		{name: "turnstile_secret", label: "Turnstile Secret *", defVal: "", help: "Secret matching your site key. Leave blank if skipping turnstile."},
+		{name: "turnstile_timeout_s", label: "Turnstile Timeout (s)", defVal: strconv.FormatInt(dc.TurnstileTimeoutS, 10), help: "How long to wait for Cloudflare before letting the request through anyway. Default: " + fmt.Sprint(dc.TurnstileTimeoutS) + "s"},
 	}
 }
 
@@ -66,6 +68,8 @@ func defaultStr(cfg Config, name string) string {
 		return strconv.Itoa(cfg.Port)
 	case "counter_file":
 		return cfg.CounterFile
+	case "backup_count":
+		return strconv.FormatInt(cfg.BackupCount, 10)
 	case "persist_interval_s":
 		return strconv.FormatInt(cfg.PersistIntervalS, 10)
 	case "check_interval_s":
@@ -80,6 +84,8 @@ func defaultStr(cfg Config, name string) string {
 		return cfg.TurnstileSiteKey
 	case "turnstile_secret":
 		return cfg.TurnstileSecret
+	case "turnstile_timeout_s":
+		return strconv.FormatInt(cfg.TurnstileTimeoutS, 10)
 	}
 	return ""
 }
@@ -392,6 +398,12 @@ func (m *Model) toConfig(cfg Config) Config {
 			}
 		case "counter_file":
 			cfg.CounterFile = v
+		case "backup_count":
+			if v != "" {
+				if n, err := strconv.ParseInt(v, 10, 64); err == nil && n >= 0 {
+					cfg.BackupCount = n
+				}
+			}
 		case "persist_interval_s":
 			if v != "" {
 				if n, err := strconv.ParseInt(v, 10, 64); err == nil && n > 0 {
@@ -426,6 +438,12 @@ func (m *Model) toConfig(cfg Config) Config {
 			cfg.TurnstileSiteKey = v
 		case "turnstile_secret":
 			cfg.TurnstileSecret = v
+		case "turnstile_timeout_s":
+			if v != "" {
+				if n, err := strconv.ParseInt(v, 10, 64); err == nil && n > 0 {
+					cfg.TurnstileTimeoutS = n
+				}
+			}
 		}
 	}
 	return cfg

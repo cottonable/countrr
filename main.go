@@ -13,6 +13,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -25,6 +26,7 @@ import (
 type Config struct {
 	Port                   int    `json:"port"`
 	CounterFile            string `json:"counter_file"`
+	BackupCount            int64  `json:"backup_count"`
 	PersistIntervalS       int64  `json:"persist_interval_s"`
 	CheckIntervalS         int64  `json:"check_interval_s"`
 	RateLimitWindowS       int64  `json:"rate_limit_window_s"`
@@ -32,6 +34,7 @@ type Config struct {
 	MinIncrementIntervalMs int64  `json:"min_increment_interval_ms"`
 	TurnstileSiteKey       string `json:"turnstile_site_key"`
 	TurnstileSecret        string `json:"turnstile_secret"`
+	TurnstileTimeoutS      int64  `json:"turnstile_timeout_s"`
 }
 
 // Default values used when config.json doesn't exist or is invalid.
@@ -39,11 +42,13 @@ func DefaultConfig() Config {
 	return Config{
 		Port:                   1312,
 		CounterFile:            "counter.txt",
+		BackupCount:            0,     // disabled
 		PersistIntervalS:       900,   // 15 min
 		CheckIntervalS:         60,    // 1 min
 		RateLimitWindowS:       21600, // 6h
 		RateLimitSweepS:        300,   // 5 min
 		MinIncrementIntervalMs: 0,     // disabled
+		TurnstileTimeoutS:      5,     // 5s
 	}
 }
 
@@ -79,6 +84,12 @@ func LoadConfig(path string) (Config, error) {
 	}
 	if cfg.MinIncrementIntervalMs < 0 {
 		cfg.MinIncrementIntervalMs = 0
+	}
+	if cfg.BackupCount < 0 {
+		cfg.BackupCount = 0
+	}
+	if cfg.TurnstileTimeoutS <= 0 {
+		cfg.TurnstileTimeoutS = DefaultConfig().TurnstileTimeoutS
 	}
 	return cfg, nil
 }
@@ -155,6 +166,28 @@ func realIP(r *http.Request) string {
 	return ip
 }
 
+// turnstileTimeout is how long the server waits for Cloudflare before treating
+// verification as inconclusive. On a timeout the request is allowed through, so
+// this is the leniency window. It never returns zero: a zero client timeout
+// means "wait forever", which would hang the request instead of failing open.
+func turnstileTimeout(cfg Config) time.Duration {
+	if cfg.TurnstileTimeoutS <= 0 {
+		return time.Duration(DefaultConfig().TurnstileTimeoutS) * time.Second
+	}
+	return time.Duration(cfg.TurnstileTimeoutS) * time.Second
+}
+
+// serverWriteTimeout leaves enough room for the slowest handler, which is a
+// request that has to wait out the outbound Turnstile verification before it
+// can answer.
+func serverWriteTimeout(cfg Config) time.Duration {
+	const base = 10 * time.Second
+	if padded := turnstileTimeout(cfg) + 5*time.Second; padded > base {
+		return padded
+	}
+	return base
+}
+
 func verifyTurnstile(token, remoteIP string) bool {
 	cfg := currentConfig()
 	if cfg.TurnstileSecret == "" || cfg.TurnstileSiteKey == "" {
@@ -179,7 +212,7 @@ func verifyTurnstile(token, remoteIP string) bool {
 	}
 	req.Header.Set("Content-Type", "application/json")
 
-	client := &http.Client{Timeout: 5 * time.Second}
+	client := &http.Client{Timeout: turnstileTimeout(cfg)}
 	resp, err := client.Do(req)
 	if err != nil {
 		fmt.Println(logWarning.Render("turnstile verification error:", err.Error()))
@@ -401,12 +434,12 @@ func startService(cfg Config) (*service, error) {
 	}))
 
 	// Timeouts keep slow or half-open clients from holding a connection forever.
-	// WriteTimeout has to outlast the outbound Turnstile verification (5s).
+	// WriteTimeout has to outlast the outbound Turnstile verification.
 	server := &http.Server{
 		Handler:           corsMiddleware(mux),
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       10 * time.Second,
-		WriteTimeout:      10 * time.Second,
+		WriteTimeout:      serverWriteTimeout(cfg),
 		IdleTimeout:       60 * time.Second,
 	}
 
@@ -426,6 +459,9 @@ func startService(cfg Config) (*service, error) {
 		cfg.Port, cfg.CheckIntervalS, cfg.PersistIntervalS, cfg.RateLimitSweepS)
 	if cfg.MinIncrementIntervalMs > 0 {
 		listening += fmt.Sprintf(" | max 1 increment per %dms", cfg.MinIncrementIntervalMs)
+	}
+	if cfg.BackupCount > 0 {
+		listening += fmt.Sprintf(" | keep %d counter backups", cfg.BackupCount)
 	}
 	fmt.Println(logStamp() + " " + logSuccess.Render(listening))
 
@@ -557,7 +593,8 @@ func loadCounter() error {
 // temporary file and then renamed over the target. A crash can therefore never
 // leave a truncated counter behind, which a plain overwrite could.
 func writeCounter(n int64) error {
-	path := resolvePath(currentConfig().CounterFile)
+	cfg := currentConfig()
+	path := resolvePath(cfg.CounterFile)
 	tmp := path + ".tmp"
 
 	if err := writeFileSynced(tmp, strconv.FormatInt(n, 10)); err != nil {
@@ -569,9 +606,47 @@ func writeCounter(n int64) error {
 		return err
 	}
 
+	if n != lastSaved.Load() {
+		backupCounter(path, n, cfg.BackupCount)
+	}
+
 	lastSaved.Store(n)
 	fmt.Println(logStamp() + " " + logSuccess.Render(fmt.Sprintf("storage saved: %d", n)))
 	return nil
+}
+
+// backupCounter drops a timestamped snapshot next to the counter file and keeps
+// only the newest keep of them. Snapshots use a fixed-width YYMMDD-HHMMSS stamp,
+// so sorting the names sorts them chronologically.
+func backupCounter(path string, n int64, keep int64) {
+	if keep <= 0 {
+		return
+	}
+
+	ext := filepath.Ext(path)
+	base := strings.TrimSuffix(path, ext)
+	snapshot := fmt.Sprintf("%s-%s%s", base, time.Now().Format("060102-150405"), ext)
+
+	if err := writeFileSynced(snapshot, strconv.FormatInt(n, 10)); err != nil {
+		fmt.Println(logWarning.Render("could not write counter backup:", err.Error()))
+		return
+	}
+
+	snapshots, err := filepath.Glob(base + "-*" + ext)
+	if err != nil {
+		fmt.Println(logWarning.Render("could not list counter backups:", err.Error()))
+		return
+	}
+	if int64(len(snapshots)) <= keep {
+		return
+	}
+
+	sort.Strings(snapshots)
+	for _, stale := range snapshots[:len(snapshots)-int(keep)] {
+		if err := os.Remove(stale); err != nil {
+			fmt.Println(logWarning.Render("could not prune counter backup:", err.Error()))
+		}
+	}
 }
 
 // writeFileSynced writes data and fsyncs it, so the bytes are durable before the
