@@ -9,9 +9,11 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
 	"path/filepath"
+	"reflect"
 	"sort"
 	"strconv"
 	"strings"
@@ -23,14 +25,15 @@ import (
 
 // Config holds every tunable setting for the server.
 type Config struct {
-	Port                   int    `json:"port"`
-	CounterFile            string `json:"counter_file"`
-	BackupCount            int64  `json:"backup_count"`
-	PersistIntervalS       int64  `json:"persist_interval_s"`
-	CheckIntervalS         int64  `json:"check_interval_s"`
-	RateLimitWindowS       int64  `json:"rate_limit_window_s"`
-	RateLimitSweepS        int64  `json:"rate_limit_sweep_s"`
-	MinIncrementIntervalMs int64  `json:"min_increment_interval_ms"`
+	Port                   int      `json:"port"`
+	CounterFile            string   `json:"counter_file"`
+	BackupCount            int64    `json:"backup_count"`
+	PersistIntervalS       int64    `json:"persist_interval_s"`
+	CheckIntervalS         int64    `json:"check_interval_s"`
+	RateLimitWindowS       int64    `json:"rate_limit_window_s"`
+	RateLimitSweepS        int64    `json:"rate_limit_sweep_s"`
+	MinIncrementIntervalMs int64    `json:"min_increment_interval_ms"`
+	AllowedDomains         []string `json:"allowed_domains"`
 }
 
 // Default values used when config.json doesn't exist or is invalid.
@@ -44,6 +47,7 @@ func DefaultConfig() Config {
 		RateLimitWindowS:       21600, // 6h
 		RateLimitSweepS:        300,   // 5 min
 		MinIncrementIntervalMs: 0,     // disabled
+		AllowedDomains:         []string{},
 	}
 }
 
@@ -65,6 +69,27 @@ func LoadConfig(path string) (Config, error) {
 		fmt.Println(logWarning.Render("invalid config, using defaults:", err.Error()))
 		return cfg, nil
 	}
+	return normalizeConfig(cfg), nil
+}
+
+// loadConfigStrict reads and parses a config file without falling back to
+// defaults. The file watcher uses it so a malformed or half-written file is
+// ignored instead of silently resetting the running server to defaults.
+func loadConfigStrict(path string) (Config, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return Config{}, err
+	}
+	cfg := DefaultConfig()
+	if err := json.Unmarshal(data, &cfg); err != nil {
+		return Config{}, err
+	}
+	return normalizeConfig(cfg), nil
+}
+
+// normalizeConfig clamps and fills values that must always be valid, so startup
+// loading and live reloads apply the same rules.
+func normalizeConfig(cfg Config) Config {
 	if cfg.PersistIntervalS <= 0 {
 		cfg.PersistIntervalS = DefaultConfig().PersistIntervalS
 	}
@@ -83,16 +108,30 @@ func LoadConfig(path string) (Config, error) {
 	if cfg.BackupCount < 0 {
 		cfg.BackupCount = 0
 	}
-	return cfg, nil
+	if cfg.AllowedDomains == nil {
+		cfg.AllowedDomains = []string{}
+	}
+	return cfg
 }
 
-// WriteConfig serializes the current config to disk.
+// WriteConfig serializes the current config to disk atomically: the bytes are
+// written to a temp file, fsynced, then renamed into place, so a reader (or the
+// config watcher) never observes a partially written file.
 func WriteConfig(path string, cfg Config) error {
 	data, err := json.MarshalIndent(cfg, "", "  ")
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(path, append(data, '\n'), 0644)
+	tmp := path + ".tmp"
+	if err := writeFileSynced(tmp, string(data)+"\n"); err != nil {
+		os.Remove(tmp)
+		return err
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		os.Remove(tmp)
+		return err
+	}
+	return nil
 }
 
 // baseDir is the directory the running binary lives in. Relative config and
@@ -165,7 +204,7 @@ var (
 	lastSaved atomic.Int64
 	lastCheck atomic.Int64
 
-	throttled         atomic.Int64
+	throttled atomic.Int64
 
 	throttleMu    sync.Mutex
 	lastIncrement time.Time
@@ -189,9 +228,124 @@ func setConfig(cfg Config) {
 	configMu.Unlock()
 }
 
+// configsEqual reports whether two configurations are identical. It is used to
+// skip redundant reloads, such as the wizard saving the file it just read.
+func configsEqual(a, b Config) bool {
+	return reflect.DeepEqual(a, b)
+}
+
+// configPollInterval is how often the config file is checked for changes. It
+// only ever reads the file, so polling costs nothing and does not wear the
+// storage device.
+const configPollInterval = 2 * time.Second
+
+// watchConfig polls the config file and hands every changed, valid
+// configuration to notify. A malformed or half-written file is ignored so the
+// running server keeps its current settings instead of silently reverting to
+// defaults.
+func watchConfig(ctx context.Context, path string, notify func(Config)) {
+	var lastMod time.Time
+	var lastSize int64
+	if info, err := os.Stat(path); err == nil {
+		lastMod = info.ModTime()
+		lastSize = info.Size()
+	}
+
+	ticker := time.NewTicker(configPollInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			info, err := os.Stat(path)
+			if err != nil {
+				continue
+			}
+			if info.ModTime().Equal(lastMod) && info.Size() == lastSize {
+				continue
+			}
+			// Remember this revision before parsing so an invalid file is not
+			// re-read every tick; a later edit bumps the timestamp again.
+			lastMod = info.ModTime()
+			lastSize = info.Size()
+
+			cfg, err := loadConfigStrict(path)
+			if err != nil {
+				fmt.Println(logWarning.Render("config change ignored, file is invalid:", err.Error()))
+				continue
+			}
+			if configsEqual(cfg, currentConfig()) {
+				continue
+			}
+			notify(cfg)
+		}
+	}
+}
+
+// parseDomainList splits a comma-separated list of domains into a cleaned slice.
+// Empty entries are dropped, so trailing or doubled commas are harmless.
+func parseDomainList(s string) []string {
+	domains := []string{}
+	for _, part := range strings.Split(s, ",") {
+		if d := strings.TrimSpace(part); d != "" {
+			domains = append(domains, d)
+		}
+	}
+	return domains
+}
+
+// normalizeOrigin reduces a domain entry or Origin header to a comparable host.
+// It accepts a bare domain ("example.com"), a full origin ("https://example.com")
+// or either with an explicit port, and returns the lowercase host. Entries
+// without a scheme are parsed as protocol-relative URLs so the host is still
+// extracted.
+func normalizeOrigin(value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return ""
+	}
+	parse := value
+	if !strings.Contains(parse, "://") {
+		parse = "//" + parse
+	}
+	if u, err := url.Parse(parse); err == nil && u.Host != "" {
+		return strings.ToLower(u.Host)
+	}
+	return strings.ToLower(strings.TrimSuffix(value, "/"))
+}
+
+// originAllowed reports whether an Origin header is permitted by the configured
+// allowlist. An empty allowlist disables the check (every origin is accepted)
+// and an entry of "*" matches every origin.
+func originAllowed(origin string, allowed []string) bool {
+	if len(allowed) == 0 {
+		return true
+	}
+	host := normalizeOrigin(origin)
+	for _, entry := range allowed {
+		if entry == "*" || normalizeOrigin(entry) == host {
+			return true
+		}
+	}
+	return false
+}
+
 func corsMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if origin := r.Header.Get("Origin"); origin != "" {
+		origin := r.Header.Get("Origin")
+
+		// When an allowlist is configured, a request carrying a disallowed
+		// Origin is refused outright. Requests without an Origin (same-origin
+		// navigations, non-browser clients) are not cross-origin and pass
+		// through.
+		if origin != "" && !originAllowed(origin, currentConfig().AllowedDomains) {
+			w.WriteHeader(http.StatusForbidden)
+			w.Write([]byte("origin not allowed"))
+			return
+		}
+
+		if origin != "" {
 			w.Header().Set("Access-Control-Allow-Origin", origin)
 			w.Header().Set("Vary", "Origin")
 		} else {
@@ -263,6 +417,19 @@ func main() {
 		fmt.Println(logStamp() + " " + logInfo.Render(`type "config" and press enter to change settings while the server runs`))
 	}
 
+	// Editing config.json on disk applies automatically. This is the only way
+	// to reconfigure a server that has no interactive terminal, such as a
+	// systemd service.
+	configChanged := make(chan Config, 1)
+	watchCtx, stopWatcher := context.WithCancel(context.Background())
+	defer stopWatcher()
+	go watchConfig(watchCtx, configPath, func(cfg Config) {
+		select {
+		case configChanged <- cfg:
+		default:
+		}
+	})
+
 	shuttingDown := false
 	interrupted := false
 
@@ -277,12 +444,17 @@ func main() {
 			os.Exit(1)
 		}
 
+		wizard := false
 		restart := false
 		select {
 		case sig := <-signals:
 			shuttingDown = true
 			interrupted = sig == os.Interrupt
 		case <-commandCh:
+			wizard = true
+			restart = true
+		case newCfg := <-configChanged:
+			setConfig(newCfg)
 			restart = true
 		}
 		run.stop()
@@ -291,14 +463,18 @@ func main() {
 			break
 		}
 
-		fmt.Println(logInfo.Render("opening configuration screen..."))
-		setConfig(reconfigure())
-		commands.Resume()
+		if wizard {
+			fmt.Println(logInfo.Render("opening configuration screen..."))
+			setConfig(reconfigure())
+			commands.Resume()
 
-		if shuttingDown {
-			break // a shutdown signal arrived while the configuration screen was open
+			if shuttingDown {
+				break // a shutdown signal arrived while the configuration screen was open
+			}
+			fmt.Println(logSuccess.Render("configuration applied, restarting service."))
+		} else {
+			fmt.Println(logSuccess.Render("configuration reloaded from file, restarting service."))
 		}
-		fmt.Println(logSuccess.Render("configuration applied, restarting service."))
 	}
 
 	// "LOSING" is deliberate: an interrupt echoes "^C" first, so the two render
@@ -316,7 +492,7 @@ func main() {
 	os.Stdout.Sync()
 }
 
-// service is one running instance of the counter: an HTTP listener plus the
+// service is one running instance of countrr: an HTTP listener plus the
 // background loops that report and persist the count.
 type service struct {
 	server *http.Server

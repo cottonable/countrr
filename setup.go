@@ -56,6 +56,7 @@ func fieldDefs() []fieldDef {
 		{name: "rate_limit_window_s", label: "Rate Limit Window (s)", defVal: strconv.FormatInt(dc.RateLimitWindowS, 10), help: "IP cooldown before allowing another request. Default: " + fmt.Sprint(dc.RateLimitWindowS) + "s"},
 		{name: "rate_limit_sweep_s", label: "Rate Limit Sweep (s)", defVal: strconv.FormatInt(dc.RateLimitSweepS, 10), help: "How often expired IP cooldowns are pruned from memory. Default: " + fmt.Sprint(dc.RateLimitSweepS) + "s"},
 		{name: "min_increment_interval_ms", label: "Min Increment Interval (ms)", defVal: strconv.FormatInt(dc.MinIncrementIntervalMs, 10), help: "Global minimum spacing between counted visits (1000 = 1s, 500 = 0.5s). 0 disables. Default: " + fmt.Sprint(dc.MinIncrementIntervalMs) + "ms"},
+		{name: "allowed_domains", label: "Allowed Domains", defVal: strings.Join(dc.AllowedDomains, ", "), help: "Only these domains may call the API, matched against the browser Origin header. Separate multiple domains with commas, e.g. example.com, www.example.com (spaces are ignored). Leave empty to allow all domains."},
 	}
 }
 
@@ -77,6 +78,8 @@ func defaultStr(cfg Config, name string) string {
 		return strconv.FormatInt(cfg.RateLimitSweepS, 10)
 	case "min_increment_interval_ms":
 		return strconv.FormatInt(cfg.MinIncrementIntervalMs, 10)
+	case "allowed_domains":
+		return strings.Join(cfg.AllowedDomains, ", ")
 	}
 	return ""
 }
@@ -425,6 +428,8 @@ func (m *Model) toConfig(cfg Config) Config {
 					cfg.MinIncrementIntervalMs = n
 				}
 			}
+		case "allowed_domains":
+			cfg.AllowedDomains = parseDomainList(v)
 		}
 	}
 	return cfg
